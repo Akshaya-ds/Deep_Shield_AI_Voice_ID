@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "framer-motion": "^13.1.0",
+    "lucide-react": "^1.31.0",
+    "wavesurfer.js": "^7.12.11"
+  }
+}
