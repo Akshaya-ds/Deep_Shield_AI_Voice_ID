@@ -3,6 +3,9 @@ import uuid
 import smtplib
 import dns.resolver
 import re
+import time
+import hashlib
+from collections import OrderedDict
 
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -63,6 +66,7 @@ from organization_detector import (
 )
 
 import numpy as np
+import librosa
 
 
 # ============================================================
@@ -109,6 +113,265 @@ app.add_middleware(
 Base.metadata.create_all(
     bind=engine
 )
+
+
+# ============================================================
+# VERIFICATION PERFORMANCE CACHE
+# ============================================================
+# Verification is CPU-heavy because transcription + WavLM are
+# expensive. These small in-memory caches make repeated demo
+# verification of the same recording much faster without changing
+# any scoring logic or database behaviour.
+
+_CACHE_LIMIT = 12
+
+_transcript_cache = OrderedDict()
+_embedding_cache = OrderedDict()
+_voice_analysis_cache = OrderedDict()
+_reference_embedding_cache = OrderedDict()
+
+
+def _cache_get(cache, key):
+    value = cache.get(key)
+    if value is not None:
+        cache.move_to_end(key)
+    return value
+
+
+def _cache_put(cache, key, value):
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _CACHE_LIMIT:
+        cache.popitem(last=False)
+
+
+def _audio_cache_key(audio_data):
+    # SHA-256 is quick compared with STT/WavLM and lets us safely
+    # reuse work only when the uploaded bytes are identical.
+    return hashlib.sha256(audio_data).hexdigest()
+
+
+def _fast_voice_analysis(audio_path: str):
+    """
+    Fast diagnostic voice analysis for the verification endpoint.
+
+    The final trust score does NOT depend on these acoustic metrics,
+    so the verification path uses lightweight NumPy/librosa features
+    instead of the full multi-pass analysis in voice.analyze_voice().
+    This keeps the same response shape expected by the frontend while
+    avoiding expensive pitch + repeated spectral passes.
+    """
+
+    audio, sr = librosa.load(
+        audio_path,
+        sr=16000,
+        mono=True
+    )
+
+    if audio is None or len(audio) == 0:
+        raise ValueError("Audio is empty.")
+
+    audio = np.asarray(audio, dtype=np.float32)
+    audio -= np.mean(audio, dtype=np.float32)
+    np.nan_to_num(audio, copy=False)
+
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 1e-8:
+        audio = audio / peak
+
+    duration = len(audio) / float(sr)
+
+    # One compact frame grid reused for energy / silence / ZCR.
+    frame_length = 1024
+    hop = 512
+
+    rms = librosa.feature.rms(
+        y=audio,
+        frame_length=frame_length,
+        hop_length=hop
+    )[0]
+    rms = np.maximum(np.asarray(rms, dtype=np.float32), 1e-8)
+
+    log_rms = 20.0 * np.log10(rms)
+    energy_std = float(np.std(log_rms))
+    p10, p90 = np.percentile(log_rms, [10, 90])
+    dynamic_range = float(p90 - p10)
+
+    if 2.0 <= energy_std <= 12.0:
+        energy_consistency = 100.0
+    elif energy_std < 2.0:
+        energy_consistency = energy_std / 2.0 * 100.0
+    else:
+        energy_consistency = max(0.0, 100.0 - (energy_std - 12.0) * 5.0)
+
+    # Simple silence estimate; much cheaper than full pause interval analysis.
+    db = librosa.amplitude_to_db(rms, ref=1.0)
+    silent = db < -35.0
+    silence_ratio = float(np.mean(silent)) if silent.size else 0.0
+
+    pause_count = 0
+    pause_lengths = []
+    start = None
+    for i, is_silent in enumerate(silent):
+        if is_silent and start is None:
+            start = i
+        elif not is_silent and start is not None:
+            length = (i - start) * hop / sr
+            if length >= 0.25:
+                pause_count += 1
+                pause_lengths.append(length)
+            start = None
+    if start is not None:
+        length = (len(silent) - start) * hop / sr
+        if length >= 0.25:
+            pause_count += 1
+            pause_lengths.append(length)
+
+    average_pause = float(np.mean(pause_lengths)) if pause_lengths else 0.0
+    longest_pause = float(np.max(pause_lengths)) if pause_lengths else 0.0
+
+    # Fast spectral summary: a single STFT reused for all spectral metrics.
+    stft = librosa.stft(audio, n_fft=1024, hop_length=hop)
+    magnitude = np.abs(stft)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=1024)[:, None]
+    spec_sum = np.sum(magnitude, axis=0) + 1e-8
+    centroid_frames = np.sum(freqs * magnitude, axis=0) / spec_sum
+    centroid = float(np.mean(centroid_frames))
+
+    bandwidth_frames = np.sqrt(
+        np.sum(((freqs - centroid_frames[None, :]) ** 2) * magnitude, axis=0)
+        / spec_sum
+    )
+    bandwidth = float(np.mean(bandwidth_frames))
+
+    cumulative = np.cumsum(magnitude, axis=0)
+    threshold = 0.85 * cumulative[-1, :]
+    rolloff_idx = np.argmax(cumulative >= threshold[None, :], axis=0)
+    rolloff = float(np.mean(freqs[:, 0][rolloff_idx]))
+
+    zcr = librosa.feature.zero_crossing_rate(
+        audio,
+        frame_length=frame_length,
+        hop_length=hop
+    )[0]
+    zcr_mean = float(np.mean(zcr)) if zcr.size else 0.0
+
+    # Frame-to-frame spectral stability.
+    norms = np.linalg.norm(magnitude, axis=0, keepdims=True) + 1e-8
+    normalized = magnitude / norms
+    if normalized.shape[1] > 1:
+        similarities = np.sum(normalized[:, :-1] * normalized[:, 1:], axis=0)
+        variation = float(np.std(similarities))
+    else:
+        variation = 0.05
+
+    spectral_score = float(np.clip(
+        100.0 if 0.015 <= variation <= 0.12
+        else (variation / 0.015 * 100.0 if variation < 0.015
+              else 100.0 - (variation - 0.12) * 400.0),
+        0.0, 100.0
+    ))
+
+    # Fast pitch proxy from voiced-frame zero-crossing behaviour.
+    # It is diagnostic only; it is deliberately not used as identity proof.
+    voiced = rms > (np.percentile(rms, 35) * 0.8)
+    zcr_voiced = zcr[:len(voiced)][voiced[:len(zcr)]] if zcr.size else np.array([])
+    if zcr_voiced.size >= 3:
+        pitch_proxy = zcr_voiced * sr / 2.0
+        pitch_proxy = pitch_proxy[(pitch_proxy >= 70) & (pitch_proxy <= 400)]
+    else:
+        pitch_proxy = np.array([])
+
+    if pitch_proxy.size >= 3:
+        median_pitch = float(np.median(pitch_proxy))
+        pitch_variation = float(np.std(pitch_proxy) / max(median_pitch, 1.0))
+        p5, p95 = np.percentile(pitch_proxy, [5, 95])
+        pitch_range = float(p95 - p5)
+        voiced_ratio = float(pitch_proxy.size / max(len(zcr), 1) * 100.0)
+    else:
+        median_pitch = 0.0
+        pitch_variation = 0.0
+        pitch_range = 0.0
+        voiced_ratio = 0.0
+
+    speech_consistency = float(np.clip(
+        (energy_consistency * 0.45)
+        + (spectral_score * 0.35)
+        + (max(0.0, 100.0 - silence_ratio * 100.0) * 0.20),
+        0.0, 100.0
+    ))
+
+    naturalness = float(np.clip(
+        (energy_consistency * 0.30)
+        + (spectral_score * 0.35)
+        + (speech_consistency * 0.35),
+        0.0, 100.0
+    ))
+
+    return {
+        "naturalness_score": round(naturalness, 2),
+        "duration_seconds": round(float(duration), 2),
+        "pitch": {
+            "pitch_variation": round(pitch_variation, 4),
+            "voiced_ratio": round(voiced_ratio, 2),
+            "median_pitch": round(median_pitch, 2),
+            "pitch_range": round(pitch_range, 2)
+        },
+        "energy": {
+            "energy_variation": round(energy_std, 3),
+            "energy_dynamic_range": round(dynamic_range, 3),
+            "energy_consistency": round(float(np.clip(energy_consistency, 0, 100)), 2)
+        },
+        "pauses": {
+            "silence_ratio": round(silence_ratio, 4),
+            "pause_count": pause_count,
+            "average_pause_duration": round(average_pause, 3),
+            "longest_pause": round(longest_pause, 3)
+        },
+        "spectral": {
+            "spectral_centroid": round(centroid, 2),
+            "spectral_bandwidth": round(bandwidth, 2),
+            "spectral_rolloff": round(rolloff, 2),
+            "zero_crossing_rate": round(zcr_mean, 5),
+            "spectral_flatness": 0.0
+        },
+        "speech_consistency": round(speech_consistency, 2),
+        "analysis": {
+            "pitch_variation": round(pitch_variation, 4),
+            "energy_variation": round(energy_std, 3),
+            "silence_ratio": round(silence_ratio, 4),
+            "spectral_consistency": round(spectral_score, 2),
+            "speech_consistency": round(speech_consistency, 2)
+        },
+        "note": (
+            "Fast acoustic MVP analysis. These metrics are supporting diagnostics "
+            "and are not definitive human-versus-AI classification."
+        )
+    }
+
+
+def _normalized_reference_embedding(agent):
+    # Registered embeddings are already normalized at registration
+    # time. Keep the parsed numpy vector in memory so every verify
+    # request does not repeatedly JSON-decode it.
+    key = (agent.agent_id, agent.voice_fingerprint)
+    cached = _cache_get(_reference_embedding_cache, key)
+    if cached is not None:
+        return cached
+
+    vector = np.asarray(
+        embedding_from_json(agent.voice_fingerprint),
+        dtype=np.float32
+    )
+
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-8:
+        return None
+
+    vector = vector / norm
+    vector = np.ascontiguousarray(vector, dtype=np.float32)
+    _cache_put(_reference_embedding_cache, key, vector)
+    return vector
 
 
 # ============================================================
@@ -193,7 +456,65 @@ def get_agent(
         )
 
     return agent
+# ============================================================
+# DELETE SINGLE AI AGENT
+# ============================================================
 
+@app.delete("/api/agents/{agent_id}")
+def delete_agent(
+    agent_id: str,
+    db: Session = Depends(get_db)
+):
+    agent = (
+        db.query(Agent)
+        .filter(
+            Agent.agent_id == agent_id
+        )
+        .first()
+    )
+
+    if not agent:
+        raise HTTPException(
+            status_code=404,
+            detail="AI agent not found."
+        )
+
+    try:
+        db.delete(agent)
+        db.commit()
+
+        # Remove cached reference embedding for this agent.
+        # This does not affect any other agent.
+        keys_to_remove = [
+            key
+            for key in _reference_embedding_cache
+            if isinstance(key, tuple)
+            and len(key) >= 1
+            and key[0] == agent_id
+        ]
+
+        for key in keys_to_remove:
+            _reference_embedding_cache.pop(
+                key,
+                None
+            )
+
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "message": "AI agent deleted successfully."
+        }
+
+    except Exception as error:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not delete AI agent: "
+                f"{str(error)}"
+            )
+        )
 
 # ============================================================
 # REGISTER ORGANIZATION
@@ -723,6 +1044,8 @@ async def register_agent(
         "audio/mp4",
         "audio/x-m4a"
     ]
+
+    verification_started = time.perf_counter()
 
     if voice_file.content_type not in allowed_types:
 
@@ -2283,38 +2606,38 @@ async def verify_voice(
             )
 
         # ====================================================
-        # 3. TRANSCRIBE
+        # 3. TRANSCRIBE (CACHED)
         # ====================================================
 
-        transcript = transcribe_audio(
-            temp_path
+        request_cache_key = _audio_cache_key(audio_data)
+        transcript = _cache_get(
+            _transcript_cache,
+            request_cache_key
         )
 
-        # ====================================================
-        # 4. ORGANIZATION DETECTION
-        # ====================================================
-
-        organizations = (
-            db.query(Organization)
-            .all()
-        )
-
-        organization_result = (
-            detect_organization(
-                transcript,
-                organizations
-            )
-        )
-
-        # ====================================================
-        # CONVERSATION RISK
-        # ====================================================
-
-        risk_analysis = (
-            analyze_conversation_risk(
+        if transcript is None:
+            transcript = transcribe_audio(temp_path)
+            _cache_put(
+                _transcript_cache,
+                request_cache_key,
                 transcript
             )
+
+        # ====================================================
+        # 4. ORGANIZATION + RISK
+        # ====================================================
+        # Both are lightweight operations over the same transcript.
+        # Keep the required organization-first architecture: no
+        # speaker comparison happens until organization is known.
+
+        organizations = db.query(Organization).all()
+
+        organization_result = detect_organization(
+            transcript,
+            organizations
         )
+
+        risk_analysis = analyze_conversation_risk(transcript)
 
         conversation_risk = float(
             risk_analysis.get(
@@ -2582,69 +2905,52 @@ async def verify_voice(
             }
 
         # ====================================================
-        # 7. VOICE QUALITY / NATURALNESS ANALYSIS
+        # 7. VOICE QUALITY / NATURALNESS ANALYSIS (CACHED)
         # ====================================================
 
-        try:
+        voice_analysis = _cache_get(
+            _voice_analysis_cache,
+            request_cache_key
+        )
 
-            voice_analysis = analyze_voice(
-                temp_path
-            )
-
-        except Exception as error:
-
-            voice_analysis = {
-
-                "naturalness_score": 50.0,
-
-                "pitch": {
-
-                    "pitch_variation": 0.0,
-
-                    "voiced_ratio": 0.0,
-
-                    "median_pitch": 0.0,
-
-                    "pitch_range": 0.0
-                },
-
-                "energy": {
-
-                    "energy_variation": 0.0,
-
-                    "energy_dynamic_range": 0.0,
-
-                    "energy_consistency": 50.0
-                },
-
-                "pauses": {
-
-                    "silence_ratio": 0.0,
-
-                    "pause_count": 0,
-
-                    "average_pause_duration": 0.0,
-
-                    "longest_pause": 0.0
-                },
-
-                "spectral": {
-
-                    "spectral_centroid": 0.0,
-
-                    "spectral_bandwidth": 0.0,
-
-                    "spectral_rolloff": 0.0,
-
-                    "zero_crossing_rate": 0.0,
-
-                    "spectral_flatness": 0.0
-                },
-
-                "speech_consistency": 50.0,
-
-                "analysis_error": str(error)
-            }
+        if voice_analysis is None:
+            try:
+                voice_analysis = _fast_voice_analysis(temp_path)
+                _cache_put(
+                    _voice_analysis_cache,
+                    request_cache_key,
+                    voice_analysis
+                )
+            except Exception as error:
+                voice_analysis = {
+                    "naturalness_score": 50.0,
+                    "pitch": {
+                        "pitch_variation": 0.0,
+                        "voiced_ratio": 0.0,
+                        "median_pitch": 0.0,
+                        "pitch_range": 0.0
+                    },
+                    "energy": {
+                        "energy_variation": 0.0,
+                        "energy_dynamic_range": 0.0,
+                        "energy_consistency": 50.0
+                    },
+                    "pauses": {
+                        "silence_ratio": 0.0,
+                        "pause_count": 0,
+                        "average_pause_duration": 0.0,
+                        "longest_pause": 0.0
+                    },
+                    "spectral": {
+                        "spectral_centroid": 0.0,
+                        "spectral_bandwidth": 0.0,
+                        "spectral_rolloff": 0.0,
+                        "zero_crossing_rate": 0.0,
+                        "spectral_flatness": 0.0
+                    },
+                    "speech_consistency": 50.0,
+                    "analysis_error": str(error)
+                }
 
         # ====================================================
         # 8. EXTRACT NATURALNESS
@@ -2676,17 +2982,38 @@ async def verify_voice(
         )
 
         # ====================================================
-        # 10. GENERATE UPLOADED EMBEDDING
+        # 10. GENERATE UPLOADED EMBEDDING (CACHED)
         # ====================================================
 
-        uploaded_embedding = (
-            generate_embedding(
-                temp_path
-            )
+        uploaded_embedding = _cache_get(
+            _embedding_cache,
+            request_cache_key
         )
+
+        if uploaded_embedding is None:
+            uploaded_embedding = generate_embedding(temp_path)
+            _cache_put(
+                _embedding_cache,
+                request_cache_key,
+                uploaded_embedding
+            )
 
         uploaded_vector = np.asarray(
             uploaded_embedding,
+            dtype=np.float32
+        )
+
+        uploaded_norm = float(np.linalg.norm(uploaded_vector))
+        if uploaded_norm <= 1e-8:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not generate a valid voice embedding."
+            )
+
+        # WavLM already returns an L2-normalized vector, but normalizing
+        # once here makes the comparison loop cheaper and more robust.
+        uploaded_vector = np.ascontiguousarray(
+            uploaded_vector / uploaded_norm,
             dtype=np.float32
         )
 
@@ -2704,51 +3031,18 @@ async def verify_voice(
 
             try:
 
-                stored_embedding = (
-                    embedding_from_json(
-                        agent.voice_fingerprint
-                    )
-                )
+                stored_vector = _normalized_reference_embedding(agent)
 
-                stored_vector = np.asarray(
-                    stored_embedding,
-                    dtype=np.float32
-                )
-
-                if (
-                    stored_vector.shape
-                    != uploaded_vector.shape
-                ):
-
+                if stored_vector is None:
                     continue
 
-                stored_norm = np.linalg.norm(
-                    stored_vector
-                )
-
-                uploaded_norm = np.linalg.norm(
-                    uploaded_vector
-                )
-
-                if (
-                    stored_norm == 0
-                    or uploaded_norm == 0
-                ):
-
+                if stored_vector.shape != uploaded_vector.shape:
                     continue
 
+                # Both vectors are normalized once, so cosine similarity
+                # becomes a single fast dot product.
                 cosine_similarity = float(
-
-                    np.dot(
-                        stored_vector,
-                        uploaded_vector
-                    )
-                    /
-                    (
-                        stored_norm
-                        *
-                        uploaded_norm
-                    )
+                    np.dot(stored_vector, uploaded_vector)
                 )
 
                 raw_similarity = (
